@@ -8,7 +8,7 @@ CHATTONOTIFY="-1001493773956"
 DBCONTAINERID="$(docker ps | grep crocodile-game-bot_postgres | awk '{ print $1 }')"
 
 CHATSCOUNT=$(docker exec "$DBCONTAINERID" \
-	psql -qtAX -U $CROCODILE_GAME_DB_USER -W $CROCODILE_GAME_DB_NAME -c 'SELECT COUNT(DISTINCT(chat_id)) FROM user_in_chats WHERE chat_id != id;')
+	psql -qtAX -U "$CROCODILE_GAME_DB_USER" -W "$CROCODILE_GAME_DB_NAME" -c 'SELECT COUNT(DISTINCT(chat_id)) FROM user_in_chats WHERE chat_id != id;')
 
 PREVVALUE="$(cat /var/tmp/crocodile-chats-count.txt)"
 ROUNDED=$(( CHATSCOUNT / 100 ))
