@@ -263,7 +263,7 @@ func statsHandler(m *tb.Message) {
 
 func startNewGameHandler(m *tb.Message) {
 	if m.Private() {
-		bot.Send(m.Sender, "Добавить бота в чат: https://t.me/Crocodile_Game_Bot?startgroup=a ")
+		bot.Send(m.Sender, "Добавить бота в чат: https://t.me/Crocodile_Game_Bot?startgroup=a")
 		return
 	}
 
