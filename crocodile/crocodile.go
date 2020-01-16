@@ -77,14 +77,14 @@ type Machine struct {
 	mutex *sync.Mutex
 }
 
-// MachineFabric aims to produce new machines with freezed Storage and WordsProvider
+// MachineFabric aims to produce new machines with frozen Storage and WordsProvider
 type MachineFabric struct {
 	Storage       Storage
 	WordsProvider WordsProvider
 	Log           Logger
 }
 
-// NewMachine returns Machine with freezed Storage and WordsProvider
+// NewMachine returns Machine with frozen Storage and WordsProvider
 func (m *MachineFabric) NewMachine(chatID int64, mesID int) *Machine {
 	return NewMachine(m.Storage, m.WordsProvider, m.Log, chatID, mesID)
 }
