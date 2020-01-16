@@ -2,7 +2,7 @@
 
 set -ex
 
-cd $(dirname "$0")
+cd "$(dirname "$0")"
 
 CHATTONOTIFY="-1001493773956"
 DBCONTAINERID="$(docker ps | grep crocodile-game-bot_postgres | awk '{ print $1 }')"
