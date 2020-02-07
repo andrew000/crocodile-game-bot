@@ -6,10 +6,10 @@ docker-build:
 	docker build -t crocodile .
 
 docker-tag:
-	docker tag crocodile docker.pkg.github.com/nuetoban/crocodile-game-bot/crocodile:latest
+	docker tag crocodile nuetoban/crocodile:latest
 
 docker-push:
-	docker push docker.pkg.github.com/nuetoban/crocodile-game-bot/crocodile:latest
+	docker push nuetoban/crocodile:latest
 
 docker-full: docker-build docker-tag docker-push
 
@@ -22,13 +22,12 @@ migrate-down:
 		'postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable' down 1
 
 run:
-	go run bot.go log.go exporter.go
+	go run .
 
 build:
 	go build -a \
 		-ldflags '-linkmode external -extldflags "-static"' \
-		-o crocodile-server \
-		bot.go log.go exporter.go
+		-o crocodile-server .
 
 get:
 	go get -v ./...

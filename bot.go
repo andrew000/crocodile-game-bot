@@ -23,10 +23,14 @@ import (
 	"html"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
+	"github.com/go-redsync/redsync"
+	"github.com/gomodule/redigo/redis"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	tb "gopkg.in/tucnak/telebot.v2"
@@ -38,9 +42,13 @@ import (
 )
 
 var (
-	machines            map[int64]*crocodile.Machine
-	fabric              *crocodile.MachineFabric
-	bot                 *tb.Bot
+	mutexFabric *redsync.Redsync
+	locks       map[int64]*redsync.Mutex
+	machines    map[int64]*crocodile.Machine
+	fabric      *crocodile.MachineFabric
+	bot         *tb.Bot
+	redisPool   *redis.Pool
+
 	textUpdatesRecieved float64
 	startTotal          float64
 	ratingTotal         float64
@@ -52,8 +60,58 @@ var (
 	ratingGetter      RatingGetter
 	statisticsGetter  StatisticsGetter
 
+	rateLimiter *RateLimiter
+
 	DEBUG = false
 )
+
+func init() {
+	locks = make(map[int64]*redsync.Mutex)
+
+	redisHost := os.Getenv("REDIS_HOST")
+	if redisHost == "" {
+		redisHost = ":6379"
+	}
+	redisPool = newPool(redisHost)
+	mutexFabric = redsync.New([]redsync.Pool{redisPool})
+	cleanupHook()
+}
+
+// https://github.com/pete911/examples-redigo
+func newPool(server string) *redis.Pool {
+	return &redis.Pool{
+		MaxIdle:     3,
+		IdleTimeout: 240 * time.Second,
+		Dial: func() (redis.Conn, error) {
+			c, err := redis.Dial("tcp", server)
+			if err != nil {
+				panic(err)
+			}
+			return c, err
+		},
+
+		TestOnBorrow: func(c redis.Conn, t time.Time) error {
+			_, err := c.Do("PING")
+			if err != nil {
+				panic(err)
+			}
+			return err
+		},
+	}
+}
+
+// https://github.com/pete911/examples-redigo
+func cleanupHook() {
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt)
+	signal.Notify(c, syscall.SIGTERM)
+	signal.Notify(c, syscall.SIGKILL)
+	go func() {
+		<-c
+		redisPool.Close()
+		os.Exit(0)
+	}()
+}
 
 type RatingGetter interface {
 	GetRating(chatID int64) ([]model.UserInChat, error)
@@ -76,7 +134,7 @@ type dbCredentials struct {
 
 func loggerMiddlewarePoller(upd *tb.Update) bool {
 	if upd.Message != nil && upd.Message.Chat != nil && upd.Message.Sender != nil {
-		log.Printf(
+		log.Debugf(
 			"Received update, chat: %d, chatTitle: \"%s\", user: %d",
 			upd.Message.Chat.ID,
 			upd.Message.Chat.Title,
@@ -129,6 +187,10 @@ func main() {
 		setLogLevel("TRACE")
 	}
 
+	if os.Getenv("CROCODILE_GAME_LOGLEVEL") != "" {
+		setLogLevel(os.Getenv("CROCODILE_GAME_LOGLEVEL"))
+	}
+
 	log.Info("Loading words")
 	f, err := os.Open("dictionaries/word_rus_min.txt")
 	if err != nil {
@@ -143,11 +205,11 @@ func main() {
 	}
 
 	log.Info("Connecting to the database")
-	pg, err := storage.NewPostgres(storage.NewConnString(
+	pg, err := storage.NewStorage(storage.NewConnString(
 		creds.Host, creds.User,
 		creds.Pass, creds.Name,
 		creds.Port, creds.KW,
-	))
+	), redisPool, storage.WrapLogrus(log))
 	if err != nil {
 		log.Fatalf("Cannot connect to database (%s, %s) on host %s: %v", creds.User, creds.Name, creds.Host, err)
 	}
@@ -158,6 +220,8 @@ func main() {
 	log.Info("Creating games fabric")
 	fabric = crocodile.NewMachineFabric(pg, wordsProvider, log)
 	machines = make(map[int64]*crocodile.Machine)
+
+	rateLimiter = NewRateLimiter(redisPool)
 
 	log.Info("Connecting to Telegram API")
 	poller := &tb.LongPoller{Timeout: 15 * time.Second}
@@ -171,12 +235,13 @@ func main() {
 	}
 
 	log.Info("Binding handlers")
-	bot.Handle(tb.OnText, textHandler)
-	bot.Handle("/start", startNewGameHandler)
+	bot.Handle(tb.OnText, mustLock(textHandler))
+	bot.Handle("/start", mustLock(startNewGameHandler))
 	bot.Handle("/rating", ratingHandler)
 	bot.Handle("/globalrating", globalRatingHandler)
 	bot.Handle("/cancel", func(m *tb.Message) {})
 	bot.Handle("/cstat", statsHandler)
+	bot.Handle("/rules", rulesHandler)
 	bindButtonsHandlers(bot)
 
 	collector := newMetricsCollector(pg)
@@ -191,6 +256,32 @@ func main() {
 	bot.Start()
 }
 
+// Decorator for distributed lock for chat (messages handlers)
+func mustLock(f func(*tb.Message)) func(*tb.Message) {
+	return func(m *tb.Message) {
+		log.Tracef("Locking chat %d", m.Chat.ID)
+		lockChat(m.Chat.ID)
+
+		f(m)
+
+		log.Tracef("Unlocking chat %d", m.Chat.ID)
+		unlockChat(m.Chat.ID)
+	}
+}
+
+// Decorator for distributed lock for chat (callback handlers)
+func mustLockCallback(f func(*tb.Callback)) func(*tb.Callback) {
+	return func(c *tb.Callback) {
+		log.Tracef("Locking chat %d", c.Message.Chat.ID)
+		lockChat(c.Message.Chat.ID)
+
+		f(c)
+
+		log.Tracef("Unlocking chat %d", c.Message.Chat.ID)
+		unlockChat(c.Message.Chat.ID)
+	}
+}
+
 func globalRatingHandler(m *tb.Message) {
 	globalRatingTotal++
 	rating, err := ratingGetter.GetGlobalRating()
@@ -201,7 +292,7 @@ func globalRatingHandler(m *tb.Message) {
 
 	ratingString := buildRating("Топ-25 <b>игроков в крокодила</b> во всех чатах 🐊", rating)
 
-	_, err = bot.Send(m.Chat, ratingString, tb.ModeHTML)
+	err = sendMessage(m.Chat, m.Chat.ID, ratingString)
 	if err != nil {
 		log.Errorf("globalRatingHandler: cannot send rating: %v", err)
 	}
@@ -236,10 +327,21 @@ func ratingHandler(m *tb.Message) {
 
 	ratingString := buildRating("Топ-25 <b>игроков в крокодила</b> 🐊", rating)
 
-	_, err = bot.Send(m.Chat, ratingString, tb.ModeHTML)
+	err = sendMessage(m.Chat, m.Chat.ID, ratingString)
 	if err != nil {
 		log.Errorf("ratingHandler: cannot send rating: %v", err)
 	}
+}
+
+func sendMessage(s tb.Recipient, chatID int64, text string) error {
+	err := rateLimiter.Limit(chatID,
+		func() error { _, err := bot.Send(s, text, tb.ModeHTML); return err },
+		func() error {
+			_, err := bot.Send(s, "Достигнут лимит по количеству сообщений в минуту!")
+			return err
+		},
+		func() error { return nil })
+	return err
 }
 
 func statsHandler(m *tb.Message) {
@@ -255,40 +357,47 @@ func statsHandler(m *tb.Message) {
 	outString += fmt.Sprintf("Количество игроков: %d\n", stats.Users)
 	outString += fmt.Sprintf("Всего игр: %d\n", stats.GamesPlayed)
 
-	_, err = bot.Send(m.Chat, outString, tb.ModeHTML)
+	err = sendMessage(m.Chat, m.Chat.ID, outString)
 	if err != nil {
 		log.Errorf("statsHandler: cannot send stats: %v", err)
 	}
 }
 
+func lockChat(chatID int64) {
+	if locks[chatID] == nil {
+		locks[chatID] = mutexFabric.NewMutex("mutex/" + strconv.Itoa(int(chatID)))
+	}
+	locks[chatID].Lock()
+}
+
+func unlockChat(chatID int64) {
+	locks[chatID].Unlock()
+}
+
 func startNewGameHandler(m *tb.Message) {
 	if m.Private() {
-		bot.Send(m.Sender, "Добавить бота в чат: https://t.me/Crocodile_Game_Bot?startgroup=a")
+		sendMessage(m.Sender, m.Chat.ID, "Добавить бота в чат: https://t.me/Crocodile_Game_Bot?startgroup=a ")
 		return
 	}
 
 	startTotal++
 
-	// If machine for this chat has been created already
-	if _, ok := machines[m.Chat.ID]; !ok {
-		machine := fabric.NewMachine(m.Chat.ID, m.ID)
-		machines[m.Chat.ID] = machine
-	}
+	machine := fabric.NewMachine(m.Chat.ID, m.ID)
 
 	username := strings.TrimSpace(m.Sender.FirstName + " " + m.Sender.LastName)
 
-	_, err := machines[m.Chat.ID].StartNewGameAndReturnWord(m.Sender.ID, username)
+	_, err := machine.StartNewGameAndReturnWord(m.Sender.ID, username)
 
 	if err != nil {
 		if err.Error() == crocodile.ErrGameAlreadyStarted {
-			_, ms, _ := utils.CalculateTimeDiff(time.Now(), machines[m.Chat.ID].GetStartedTime())
+			_, ms, _ := utils.CalculateTimeDiff(time.Now(), machine.GetStartedTime())
 
 			if ms < 2 {
-				bot.Send(m.Chat, "Игра уже начата! Ожидайте 2 минуты")
+				sendMessage(m.Chat, m.Chat.ID, "Игра уже начата! Ожидайте 2 минуты")
 				return
 			} else {
-				machines[m.Chat.ID].StopGame()
-				_, err = machines[m.Chat.ID].StartNewGameAndReturnWord(m.Sender.ID, username)
+				machine.StopGame()
+				_, err = machine.StartNewGameAndReturnWord(m.Sender.ID, username)
 				if err != nil {
 					log.Println(err)
 				}
@@ -311,15 +420,9 @@ func startNewGameHandler(m *tb.Message) {
 
 func startNewGameHandlerCallback(c *tb.Callback) {
 	m := c.Message
-	var ma *crocodile.Machine
 
 	// If machine for this chat has been created already
-	if _, ok := machines[m.Chat.ID]; !ok {
-		machine := fabric.NewMachine(m.Chat.ID, m.ID)
-		machines[m.Chat.ID] = machine
-	}
-
-	ma = machines[m.Chat.ID]
+	ma := fabric.NewMachine(m.Chat.ID, m.ID)
 
 	username := strings.TrimSpace(c.Sender.FirstName + " " + c.Sender.LastName)
 	_, err := ma.StartNewGameAndReturnWord(c.Sender.ID, username)
@@ -360,52 +463,53 @@ func startNewGameHandlerCallback(c *tb.Callback) {
 func textHandler(m *tb.Message) {
 	textUpdatesRecieved++
 
-	if ma, ok := machines[m.Chat.ID]; ok {
-		if ma.GetHost() != m.Sender.ID || DEBUG {
-			word := strings.TrimSpace(strings.ToLower(m.Text))
-			username := strings.TrimSpace(m.Sender.FirstName + " " + m.Sender.LastName)
-			if ma.CheckWordAndSetWinner(word, m.Sender.ID, username) {
-				username := strings.TrimSpace(m.Sender.FirstName + " " + m.Sender.LastName)
-				bot.Send(
-					m.Chat,
-					fmt.Sprintf(
-						"%s отгадал слово <b>%s</b>",
-						username, word,
-					),
-					tb.ModeHTML,
-					&tb.ReplyMarkup{InlineKeyboard: newGameInlineKeys},
-				)
-			}
+	ma := fabric.NewMachine(m.Chat.ID, m.ID)
+
+	if ma.GetHost() != m.Sender.ID || DEBUG {
+		username := strings.TrimSpace(m.Sender.FirstName + " " + m.Sender.LastName)
+		if word, ok := ma.CheckWordAndSetWinner(m.Text, m.Sender.ID, username); ok {
+			bot.Send(
+				m.Chat,
+				fmt.Sprintf(
+					"%s отгадал слово <b>%s</b>",
+					username, word,
+				),
+				tb.ModeHTML,
+				&tb.ReplyMarkup{InlineKeyboard: newGameInlineKeys},
+			)
 		}
 	}
 }
 
 func seeWordCallbackHandler(c *tb.Callback) {
-	if m, ok := machines[c.Message.Chat.ID]; ok {
-		var message string
+	m := fabric.NewMachine(c.Message.Chat.ID, c.Message.ID)
+	var message string
 
-		if c.Sender.ID != m.GetHost() {
-			message = "Это слово предназначено не для тебя!"
-		} else {
-			message = m.GetWord()
-		}
-
-		bot.Respond(c, &tb.CallbackResponse{Text: message, ShowAlert: true})
+	if c.Sender.ID != m.GetHost() {
+		message = "Это слово предназначено не для тебя!"
+	} else {
+		message = m.GetWord()
 	}
+
+	bot.Respond(c, &tb.CallbackResponse{Text: message, ShowAlert: true})
 }
 
 func nextWordCallbackHandler(c *tb.Callback) {
-	if m, ok := machines[c.Message.Chat.ID]; ok {
-		var message string
+	m := fabric.NewMachine(c.Message.Chat.ID, c.Message.ID)
+	var message string
+	var err error
 
-		if c.Sender.ID != m.GetHost() {
-			message = "Это слово предназначено не для тебя!"
-		} else {
-			message, _ = m.SetNewRandomWord()
+	if c.Sender.ID != m.GetHost() {
+		message = "Это слово предназначено не для тебя!"
+	} else {
+		message, err = m.SetNewRandomWord()
+		if err != nil {
+			log.Errorf("nextWordCallbackHandler: cannot get word: %v", err)
+			return
 		}
-
-		bot.Respond(c, &tb.CallbackResponse{Text: message, ShowAlert: true})
 	}
+
+	bot.Respond(c, &tb.CallbackResponse{Text: message, ShowAlert: true})
 }
 
 func bindButtonsHandlers(bot *tb.Bot) {
@@ -416,7 +520,19 @@ func bindButtonsHandlers(bot *tb.Bot) {
 	wordsInlineKeys = [][]tb.InlineButton{[]tb.InlineButton{seeWord}, []tb.InlineButton{nextWord}}
 	newGameInlineKeys = [][]tb.InlineButton{[]tb.InlineButton{newGame}}
 
-	bot.Handle(&newGame, startNewGameHandlerCallback)
-	bot.Handle(&seeWord, seeWordCallbackHandler)
-	bot.Handle(&nextWord, nextWordCallbackHandler)
+	bot.Handle(&newGame, mustLockCallback(startNewGameHandlerCallback))
+	bot.Handle(&seeWord, mustLockCallback(seeWordCallbackHandler))
+	bot.Handle(&nextWord, mustLockCallback(nextWordCallbackHandler))
+}
+
+func rulesHandler(m *tb.Message) {
+	sendMessage(m.Chat, m.Chat.ID, `
+<b>ПРАВИЛА ИГРЫ В КРОКОДИЛА</b>
+
+Есть ведущий и есть игроки, которые отгадывают слова.
+
+После нажатия /start@Crocodile_Game_Bot задача ведущего — нажать кнопку "Посмотреть слово" и объяснить его, не используя однокоренные слова.
+Если слово не нравится, то можно нажать "Следующее слово".
+Задача игроков — отгадать загаданное слово, для этого нужно просто писать их в чат, по одному слову в сообщении.
+`)
 }
